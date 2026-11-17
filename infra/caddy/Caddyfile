@@ -1,0 +1,47 @@
+# HTTPS front door for a public deployment. Caddy fetches and renews a Let's Encrypt
+# certificate for DEVNEXA_DOMAIN and redirects plain HTTP to HTTPS.
+{
+	# Apps deployed from GitHub live at https://<app>.<domain>. Certificates are issued on demand,
+	# and only for app names the DevAria backend knows about.
+	on_demand_tls {
+		ask http://backend:8000/api/apps/tls-check
+	}
+}
+
+{$DEVNEXA_DOMAIN} {
+	encode gzip
+	reverse_proxy frontend:80
+}
+
+# With a wildcard DNS record, www also reaches this server; send it to the dashboard.
+www.{$DEVNEXA_DOMAIN} {
+	redir https://{$DEVNEXA_DOMAIN}{uri} permanent
+}
+
+*.{$DEVNEXA_DOMAIN} {
+	tls {
+		on_demand
+	}
+	encode gzip
+	# One JSON line per request. The backend tails this file for the dashboard's live traffic view.
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 20MiB
+			roll_keep 3
+		}
+		format json
+	}
+	# Live issue capture: the browser script and its report endpoint are served by DevAria on every app's domain.
+	handle /__devnexa/* {
+		reverse_proxy backend:8000
+	}
+	handle {
+		# The backend answers which container serves this hostname (or a "not deployed" page). With the load
+		# balancer step on, it rotates through the app's healthy replicas.
+		forward_auth backend:8000 {
+			uri /api/apps/route
+			copy_headers X-Devnexa-Upstream
+		}
+		reverse_proxy {http.request.header.X-Devnexa-Upstream}
+	}
+}

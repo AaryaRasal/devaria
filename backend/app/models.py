@@ -1,0 +1,563 @@
+from datetime import datetime, timezone
+
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.types import TypeDecorator
+
+from .config import get_settings
+from .db import Base, EmbeddingType
+
+EMBED_DIM = get_settings().embedding_dim
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class TZDateTime(TypeDecorator):
+    """Timezone-aware UTC DateTime that also round-trips through SQLite (which drops tzinfo)."""
+
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is not None and value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value
+
+    def process_result_value(self, value, dialect):
+        if value is not None and value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value
+
+
+# ---------------------------------------------------------------- CI/CD layer
+class PipelineRun(Base):
+    __tablename__ = "pipeline_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    repo: Mapped[str] = mapped_column(String(200), default="devnexa/sample-app")
+    branch: Mapped[str] = mapped_column(String(120), default="main")
+    commit_sha: Mapped[str] = mapped_column(String(64))
+    commit_message: Mapped[str] = mapped_column(Text, default="")
+    author: Mapped[str] = mapped_column(String(120), default="developer")
+    changed_files: Mapped[list] = mapped_column(JSON, default=list)
+    trigger: Mapped[str] = mapped_column(String(40), default="manual")
+    external_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="queued")
+    current_stage: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    test_strategy: Mapped[str] = mapped_column(String(20), default="prioritized")
+    risk_score: Mapped[float] = mapped_column(Float, default=0.0)
+    risk_factors: Mapped[list] = mapped_column(JSON, default=list)
+    ai_feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
+    injected_defect: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+
+    stages: Mapped[list["StageRun"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan", order_by="StageRun.id"
+    )
+    tests: Mapped[list["TestExecution"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan", order_by="TestExecution.order"
+    )
+
+
+class StageRun(Base):
+    __tablename__ = "stage_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("pipeline_runs.id", ondelete="CASCADE"))
+    name: Mapped[str] = mapped_column(String(20))
+    agent: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    logs: Mapped[str] = mapped_column(Text, default="")
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
+    started_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+
+    run: Mapped[PipelineRun] = relationship(back_populates="stages")
+
+
+class TestCase(Base):
+    __tablename__ = "test_cases"
+
+    id: Mapped[str] = mapped_column(String(200), primary_key=True)
+    name: Mapped[str] = mapped_column(String(200))
+    module: Mapped[str] = mapped_column(String(80))
+    covers: Mapped[list] = mapped_column(JSON, default=list)
+    detects: Mapped[list] = mapped_column(JSON, default=list)
+    duration_s: Mapped[float] = mapped_column(Float, default=1.0)
+    kind: Mapped[str] = mapped_column(String(20), default="unit")
+    is_regression: Mapped[bool] = mapped_column(Boolean, default=False)
+    origin_incident_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    failure_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+
+
+class TestExecution(Base):
+    __tablename__ = "test_executions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("pipeline_runs.id", ondelete="CASCADE"))
+    test_id: Mapped[str] = mapped_column(String(200))
+    module: Mapped[str] = mapped_column(String(80))
+    order: Mapped[int] = mapped_column(Integer, default=0)
+    selected: Mapped[bool] = mapped_column(Boolean, default=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    priority_score: Mapped[float] = mapped_column(Float, default=0.0)
+    reasons: Mapped[list] = mapped_column(JSON, default=list)
+    duration_s: Mapped[float] = mapped_column(Float, default=0.0)
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    run: Mapped[PipelineRun] = relationship(back_populates="tests")
+
+
+class Deployment(Base):
+    __tablename__ = "deployments"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    service: Mapped[str] = mapped_column(String(80), default="orders-service")
+    version: Mapped[str] = mapped_column(String(40))
+    image: Mapped[str] = mapped_column(String(200))
+    commit_sha: Mapped[str] = mapped_column(String(64))
+    environment: Mapped[str] = mapped_column(String(40), default="staging")
+    status: Mapped[str] = mapped_column(String(20), default="active")
+    health: Mapped[str] = mapped_column(String(20), default="healthy")
+    is_stable: Mapped[bool] = mapped_column(Boolean, default=False)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    deployed_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+
+
+# ---------------------------------------------------------- incident handling
+class Alert(Base):
+    __tablename__ = "alerts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    fingerprint: Mapped[str] = mapped_column(String(120), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    severity: Mapped[str] = mapped_column(String(20), default="warning")
+    service: Mapped[str] = mapped_column(String(80), default="orders-service")
+    status: Mapped[str] = mapped_column(String(20), default="firing")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    labels: Mapped[dict] = mapped_column(JSON, default=dict)
+    source: Mapped[str] = mapped_column(String(40), default="alertmanager")
+    starts_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+    received_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+    incident_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class Incident(Base):
+    __tablename__ = "incidents"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(240))
+    status: Mapped[str] = mapped_column(String(30), default="open")
+    severity: Mapped[str] = mapped_column(String(20), default="warning")
+    service: Mapped[str] = mapped_column(String(80), default="orders-service")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    alert_name: Mapped[str] = mapped_column(String(120), default="")
+    # Ground truth for controlled fault-injection experiments (never shown to the analyzer).
+    fault_scenario: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    fault_started_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    detected_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+    resolved_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    human_interventions: Mapped[int] = mapped_column(Integer, default=0)
+    workflow: Mapped[list] = mapped_column(JSON, default=list)
+    confirmed_cause_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    is_recurrence: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    evidence: Mapped[list["EvidenceItem"]] = relationship(
+        back_populates="incident", cascade="all, delete-orphan", order_by="EvidenceItem.id"
+    )
+    diagnoses: Mapped[list["Diagnosis"]] = relationship(
+        back_populates="incident", cascade="all, delete-orphan", order_by="Diagnosis.id"
+    )
+    actions: Mapped[list["RemediationAction"]] = relationship(
+        back_populates="incident", cascade="all, delete-orphan", order_by="RemediationAction.id"
+    )
+    health_checks: Mapped[list["HealthCheck"]] = relationship(
+        back_populates="incident", cascade="all, delete-orphan", order_by="HealthCheck.id"
+    )
+
+
+class EvidenceItem(Base):
+    __tablename__ = "evidence_items"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    incident_id: Mapped[int] = mapped_column(ForeignKey("incidents.id", ondelete="CASCADE"))
+    kind: Mapped[str] = mapped_column(String(20))
+    source: Mapped[str] = mapped_column(String(40))
+    title: Mapped[str] = mapped_column(String(240))
+    content: Mapped[dict] = mapped_column(JSON, default=dict)
+    collected_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+
+    incident: Mapped[Incident] = relationship(back_populates="evidence")
+
+
+class Diagnosis(Base):
+    __tablename__ = "diagnoses"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    incident_id: Mapped[int] = mapped_column(ForeignKey("incidents.id", ondelete="CASCADE"))
+    attempt: Mapped[int] = mapped_column(Integer, default=1)
+    root_cause_id: Mapped[str] = mapped_column(String(80))
+    root_cause: Mapped[str] = mapped_column(Text)
+    affected_component: Mapped[str] = mapped_column(String(120))
+    confidence: Mapped[float] = mapped_column(Float, default=0.5)
+    uncertainty: Mapped[str] = mapped_column(Text, default="")
+    reasoning: Mapped[str] = mapped_column(Text, default="")
+    supporting_evidence: Mapped[list] = mapped_column(JSON, default=list)
+    alternatives: Mapped[list] = mapped_column(JSON, default=list)
+    similar_incidents: Mapped[list] = mapped_column(JSON, default=list)
+    proposed_action: Mapped[str] = mapped_column(String(60))
+    provider: Mapped[str] = mapped_column(String(40), default="heuristic")
+    used_rag: Mapped[bool] = mapped_column(Boolean, default=True)
+    outcome: Mapped[str] = mapped_column(String(20), default="pending")
+    created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+
+    incident: Mapped[Incident] = relationship(back_populates="diagnoses")
+
+
+class RemediationAction(Base):
+    __tablename__ = "remediation_actions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    incident_id: Mapped[int] = mapped_column(ForeignKey("incidents.id", ondelete="CASCADE"))
+    diagnosis_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    action_type: Mapped[str] = mapped_column(String(60))
+    title: Mapped[str] = mapped_column(String(200))
+    description: Mapped[str] = mapped_column(Text, default="")
+    params: Mapped[dict] = mapped_column(JSON, default=dict)
+    risk_level: Mapped[str] = mapped_column(String(10))
+    decision: Mapped[str] = mapped_column(String(30))
+    status: Mapped[str] = mapped_column(String(30), default="proposed")
+    requested_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+    decided_by: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    decision_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    executed_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    incident: Mapped[Incident] = relationship(back_populates="actions")
+
+
+class HealthCheck(Base):
+    __tablename__ = "health_checks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    incident_id: Mapped[int | None] = mapped_column(
+        ForeignKey("incidents.id", ondelete="CASCADE"), nullable=True
+    )
+    action_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    deployment_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    target: Mapped[str] = mapped_column(String(120))
+    passed: Mapped[bool] = mapped_column(Boolean)
+    checks: Mapped[list] = mapped_column(JSON, default=list)
+    checked_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+
+    incident: Mapped[Incident | None] = relationship(back_populates="health_checks")
+
+
+# ------------------------------------------------------- knowledge & learning
+class KnowledgeEntry(Base):
+    __tablename__ = "knowledge_entries"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    incident_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    title: Mapped[str] = mapped_column(String(240))
+    symptoms: Mapped[str] = mapped_column(Text)
+    root_cause_id: Mapped[str] = mapped_column(String(80))
+    root_cause: Mapped[str] = mapped_column(Text)
+    action_type: Mapped[str] = mapped_column(String(60))
+    outcome: Mapped[str] = mapped_column(String(40), default="resolved")
+    service: Mapped[str] = mapped_column(String(80), default="orders-service")
+    affected_module: Mapped[str] = mapped_column(String(80))
+    missed_test: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    regression_test: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    tags: Mapped[list] = mapped_column(JSON, default=list)
+    verified: Mapped[bool] = mapped_column(Boolean, default=True)
+    mttr_s: Mapped[float | None] = mapped_column(Float, nullable=True)
+    times_retrieved: Mapped[int] = mapped_column(Integer, default=0)
+    embedding: Mapped[list | None] = mapped_column(EmbeddingType(EMBED_DIM), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+
+
+class ModuleRisk(Base):
+    __tablename__ = "module_risk"
+
+    module: Mapped[str] = mapped_column(String(80), primary_key=True)
+    risk_score: Mapped[float] = mapped_column(Float, default=0.0)
+    incident_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_incident_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+
+
+class PolicyRule(Base):
+    __tablename__ = "policy_rules"
+
+    action_type: Mapped[str] = mapped_column(String(60), primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    description: Mapped[str] = mapped_column(Text, default="")
+    risk_level: Mapped[str] = mapped_column(String(10))
+    allowlisted: Mapped[bool] = mapped_column(Boolean, default=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    ts: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow, index=True)
+    actor: Mapped[str] = mapped_column(String(120))
+    action: Mapped[str] = mapped_column(String(120))
+    entity_type: Mapped[str] = mapped_column(String(40))
+    entity_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    message: Mapped[str] = mapped_column(Text, default="")
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ExperimentRun(Base):
+    __tablename__ = "experiment_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(20), default="running")
+    config: Mapped[dict] = mapped_column(JSON, default=dict)
+    results: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+
+
+class KeyValue(Base):
+    """Small persistent store, e.g. for the simulated environment's state."""
+
+    __tablename__ = "kv_store"
+
+    key: Mapped[str] = mapped_column(String(120), primary_key=True)
+    value: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+# ------------------------------------------------------ user repo deployments
+class AppDeployment(Base):
+    """One deploy of a user's GitHub repo as a container, with its logs, health and agent findings."""
+
+    __tablename__ = "app_deployments"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    app: Mapped[str] = mapped_column(String(60), index=True)
+    repo: Mapped[str] = mapped_column(String(200))
+    branch: Mapped[str] = mapped_column(String(120), default="main")
+    root_dir: Mapped[str] = mapped_column(String(200), default="")
+    commit_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    commit_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="queued")
+    health: Mapped[str] = mapped_column(String(20), default="unknown")
+    build_kind: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    image: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    container: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    host_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    url: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    env: Mapped[dict] = mapped_column(JSON, default=dict)
+    options: Mapped[dict] = mapped_column(JSON, default=dict)
+    build_log: Mapped[str] = mapped_column(Text, default="")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    diagnosis: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    remediations: Mapped[list] = mapped_column(JSON, default=list)
+    metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    restarts: Mapped[int] = mapped_column(Integer, default=0)
+    parent_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    triggered_by: Mapped[str] = mapped_column(String(120), default="operator")
+    created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+
+
+# ------------------------------------------------ releases, live issues, previews
+class AppRelease(Base):
+    """A versioned image of an app (v1, v2, ...) or a scheduled backup snapshot. Older ones are kept as backups."""
+
+    __tablename__ = "app_releases"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    app: Mapped[str] = mapped_column(String(60), index=True)
+    version: Mapped[int | None] = mapped_column(Integer, nullable=True)   # None for scheduled snapshots
+    label: Mapped[str] = mapped_column(String(60))                        # "v3" or "backup 2026-11-02 10:00"
+    kind: Mapped[str] = mapped_column(String(20), default="release")      # release | snapshot
+    image: Mapped[str] = mapped_column(String(200))
+    deployment_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    commit_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    commit_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source: Mapped[str] = mapped_column(String(40), default="deploy")     # deploy | push | fix-merge | schedule
+    status: Mapped[str] = mapped_column(String(20), default="live")       # live | backup | removed
+    port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    build_kind: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+
+
+class AppIssue(Base):
+    """A problem seen on a live app: browser errors, blank pages or sections, failing API calls, server errors,
+    or a section a person flagged. Repeats are grouped by fingerprint."""
+
+    __tablename__ = "app_issues"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    app: Mapped[str] = mapped_column(String(60), index=True)
+    fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    source: Mapped[str] = mapped_column(String(20))        # browser | server | scan | user
+    kind: Mapped[str] = mapped_column(String(30))          # js_error, api_error, blank_page, server_error, ...
+    severity: Mapped[str] = mapped_column(String(10), default="error")
+    message: Mapped[str] = mapped_column(Text)
+    page: Mapped[str] = mapped_column(String(300), default="/")
+    section: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    selector: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    stack: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sample: Mapped[dict] = mapped_column(JSON, default=dict)
+    count: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(20), default="open")  # open | fixing | in_preview | resolved | ignored
+    deployment_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    preview_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    fix: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    reopened: Mapped[int] = mapped_column(Integer, default=0)
+    first_seen: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+    last_seen: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+
+
+class AppPreview(Base):
+    """A fix (or any) branch deployed to its own test URL. Approving merges it into the app's branch."""
+
+    __tablename__ = "app_previews"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    app: Mapped[str] = mapped_column(String(60), index=True)
+    preview_app: Mapped[str] = mapped_column(String(60))
+    repo: Mapped[str] = mapped_column(String(200))
+    base_branch: Mapped[str] = mapped_column(String(120))
+    branch: Mapped[str] = mapped_column(String(160))
+    issue_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pr_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pr_url: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    deployment_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="deploying")  # deploying|ready|failed|merged|rejected
+    title: Mapped[str] = mapped_column(String(300), default="")
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str] = mapped_column(String(120), default="operator")
+    decided_by: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+    decided_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+
+
+# ------------------------------------------------------- data backups and trash
+class AppBackup(Base):
+    """A backup of an app's data: its persistent /data volume and its database dump, plus which code version was
+    live. Files live in <backups_dir>/<app>/<id>/. Deleting one moves it to the trash first."""
+
+    __tablename__ = "app_backups"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    app: Mapped[str] = mapped_column(String(60), index=True)
+    kind: Mapped[str] = mapped_column(String(20), default="manual")   # scheduled|manual|pre-deploy|pre-restore|final|imported
+    status: Mapped[str] = mapped_column(String(20), default="running")  # running|ready|failed|trashed|purged
+    label: Mapped[str] = mapped_column(String(120), default="")
+    parts: Mapped[list] = mapped_column(JSON, default=list)            # [{type, file, bytes, engine?, source}]
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)  # content hash, for skip-unchanged
+    verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    pinned: Mapped[bool] = mapped_column(Boolean, default=False)       # never removed by retention
+    release_label: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    release_image: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    commit_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str] = mapped_column(String(120), default="operator")
+    created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+    trashed_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    trashed_by: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    trash_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)  # purge time while in the trash
+
+
+class AppDatabase(Base):
+    """A database DevAria runs for an app (its own container and volume). Deleting it moves it to the trash:
+    the container stops but the volume is kept until the trash is emptied or the item expires."""
+
+    __tablename__ = "app_databases"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    app: Mapped[str] = mapped_column(String(60), index=True)
+    engine: Mapped[str] = mapped_column(String(20))                    # postgres | mysql | mongo
+    container: Mapped[str] = mapped_column(String(120))
+    volume: Mapped[str] = mapped_column(String(120))
+    db_name: Mapped[str] = mapped_column(String(60))
+    username: Mapped[str] = mapped_column(String(60))
+    password: Mapped[str] = mapped_column(String(120))
+    status: Mapped[str] = mapped_column(String(20), default="running")  # running|failed|trashed|purged
+    created_by: Mapped[str] = mapped_column(String(120), default="operator")
+    created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+    trashed_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    trashed_by: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+
+
+# ------------------------------------------------------------ remote servers
+class Server(Base):
+    """Another machine DevAria can deploy apps to and manage over SSH (its Docker engine is driven through
+    `DOCKER_HOST=ssh://...`). The DevAria host itself is the implicit local server and has no row."""
+
+    __tablename__ = "servers"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(60), unique=True)
+    host: Mapped[str] = mapped_column(String(255))
+    ssh_port: Mapped[int] = mapped_column(Integer, default=22)
+    username: Mapped[str] = mapped_column(String(64), default="root")
+    private_key: Mapped[str] = mapped_column(Text)
+    public_key: Mapped[str] = mapped_column(Text)
+    known_hosts: Mapped[str] = mapped_column(Text, default="")
+    # Where app traffic reaches this server (IP or hostname). Defaults to `host`.
+    address: Mapped[str] = mapped_column(String(255), default="")
+    port_base: Mapped[int] = mapped_column(Integer, default=20000)
+    status: Mapped[str] = mapped_column(String(20), default="new")  # new|online|no_docker|offline
+    facts: Mapped[dict] = mapped_column(JSON, default=dict)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    job: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_by: Mapped[str] = mapped_column(String(120), default="operator")
+    # The GitHub login the server belongs to (only they and admins see it). None: added before multi-user
+    # sign-in, so it belongs to the admins.
+    owner: Mapped[str | None] = mapped_column(String(60), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+    checked_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+
+
+# ------------------------------------------------------------ users and ownership
+class User(Base):
+    """A GitHub account that signed in. Their OAuth token is kept separately (kv_store `github:user:<login>`).
+
+    role: admin (sees and manages everything, approves users) | member (sees only their own apps and servers).
+    status: active | pending (signed in, waiting for an admin to approve) | blocked."""
+
+    __tablename__ = "users"
+
+    login: Mapped[str] = mapped_column(String(60), primary_key=True)  # lower case
+    display_login: Mapped[str] = mapped_column(String(60))
+    name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    avatar_url: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    role: Mapped[str] = mapped_column(String(20), default="member")
+    status: Mapped[str] = mapped_column(String(20), default="active")
+    note: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)
+    last_login_at: Mapped[datetime | None] = mapped_column(TZDateTime(), nullable=True)
+    decided_by: Mapped[str | None] = mapped_column(String(60), nullable=True)
+
+
+class AppOwner(Base):
+    """Who an app name belongs to. App names are global (each is a subdomain), so the first user to deploy a name
+    keeps it. Test URLs (<app>-pr-N, <app>-fix-N) belong to the owner of their app. Apps with no row were deployed
+    before multi-user sign-in and belong to the admins."""
+
+    __tablename__ = "app_owners"
+
+    app: Mapped[str] = mapped_column(String(60), primary_key=True)
+    owner: Mapped[str] = mapped_column(String(60), index=True)
+    created_at: Mapped[datetime] = mapped_column(TZDateTime(), default=utcnow)

@@ -1,0 +1,987 @@
+"""Deploy Agent for user repos: clone -> detect -> docker build -> run -> health check, live logs,
+runtime monitoring, and diagnose -> graded remediation -> verify -> learn when something breaks."""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import shutil
+import subprocess
+import threading
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable
+
+import httpx
+from sqlalchemy import select
+
+from ..config import get_settings
+from ..db import session_scope
+from ..models import AppDeployment, AppIssue, KeyValue
+from ..services import app_doctor, backups, buildplan, github, issues, policy, releases, servers
+from ..services.audit import audit
+
+log = logging.getLogger("devnexa.deploy")
+ACTIVE = ("queued", "cloning", "building", "starting")
+ERROR_LINE = re.compile(r"\b(error|exception|traceback|fatal|panic|unhandled)\b", re.I)
+
+
+def now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def slugify(name: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return (s[:40].strip("-") or "app")
+
+
+# --------------------------------------------------------------- execution
+class Executor:
+    """Runs host commands (git, docker, ssh). Tests swap in a fake. Docker commands go to the Docker engine of the
+    server selected with `servers.use(...)` (DOCKER_HOST=ssh://...), or to the local engine outside such a block."""
+
+    def available(self) -> bool:
+        return shutil.which("docker") is not None
+
+    def run(self, cmd: list[str], on_line: Callable[[str], None] | None = None, timeout: float | None = None,
+            env: dict | None = None) -> tuple[int, str]:
+        import os
+
+        target = servers.current()
+        if target and cmd[:1] == ["docker"]:
+            env = {**(env or {}), "DOCKER_HOST": target["docker_host"]}
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                errors="replace", env={**os.environ, **(env or {})})
+        timer = threading.Timer(timeout, proc.kill) if timeout else None
+        if timer:
+            timer.start()
+        out = []
+        try:
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                out.append(line)
+                if on_line:
+                    on_line(line)
+            proc.wait()
+        finally:
+            if timer:
+                timer.cancel()
+        return proc.returncode, "\n".join(out)
+
+
+executor = Executor()
+
+
+def probe(url: str) -> tuple[int | None, float]:
+    """HTTP GET; returns (status or None if unreachable, latency ms)."""
+    t = time.monotonic()
+    try:
+        r = httpx.get(url, timeout=5.0, follow_redirects=False)
+        return r.status_code, round((time.monotonic() - t) * 1000, 1)
+    except httpx.HTTPError:
+        return None, round((time.monotonic() - t) * 1000, 1)
+
+
+# -------------------------------------------------------------- live logs
+_buffers: dict[int, list[str]] = {}
+_buf_lock = threading.Lock()
+
+
+def buffered_lines(dep_id: int, start: int = 0) -> list[str] | None:
+    with _buf_lock:
+        buf = _buffers.get(dep_id)
+        return None if buf is None else buf[start:]
+
+
+class DeployLog:
+    def __init__(self, dep_id: int, secrets: list[str]):
+        self.dep_id = dep_id
+        self.secrets = [s for s in secrets if s]
+        self.flushed_at = 0.0
+        with _buf_lock:
+            _buffers[dep_id] = []
+
+    def __call__(self, line: str):
+        for s in self.secrets:
+            line = line.replace(s, "***")
+        with _buf_lock:
+            _buffers[self.dep_id].append(line)
+        if time.monotonic() - self.flushed_at > 2:
+            self.flush()
+
+    def step(self, text: str):
+        self(f"==> {text}")
+
+    def text(self) -> str:
+        with _buf_lock:
+            return "\n".join(_buffers.get(self.dep_id, []))
+
+    def flush(self):
+        self.flushed_at = time.monotonic()
+        with session_scope() as db:
+            dep = db.get(AppDeployment, self.dep_id)
+            dep.build_log = self.text()[-400000:]
+
+
+def _update(dep_id: int, **fields) -> AppDeployment:
+    with session_scope() as db:
+        dep = db.get(AppDeployment, dep_id)
+        for k, v in fields.items():
+            setattr(dep, k, v)
+        return dep
+
+
+class DeployFailed(Exception):
+    def __init__(self, stage: str, message: str, output: str = ""):
+        super().__init__(message)
+        self.stage, self.output = stage, output
+
+
+def public_url(app: str, host_port: int | None, target: dict | None = None) -> str:
+    s = get_settings()
+    if s.apps_domain:  # Caddy on the DevAria host proxies to the app, wherever it runs
+        return f"https://{app}.{s.apps_domain}"
+    return f"http://{target['address'] if target else s.apps_public_host}:{host_port}"
+
+
+def upstream(container: str, port: int, host_port: int | None, target: dict | None) -> str:
+    """host:port where the DevAria host reaches the app: the container on the shared Docker network locally, or
+    the published port on a remote server."""
+    return f"{target['address']}:{host_port}" if target else f"{container}:{port}"
+
+
+# ------------------------------------------------------------------ deploy
+def create_deployment(db, repo: str, branch: str, app: str | None = None, root_dir: str = "",
+                      env: dict | None = None, options: dict | None = None, parent_id: int | None = None,
+                      actor: str = "operator") -> AppDeployment:
+    from ..services import owners
+
+    name = slugify(app or repo.split("/")[-1])
+    owners.claim(db, name, owners.owner_for_new_deployment(db, options, actor))  # raises NameTaken
+    dep = AppDeployment(app=name, repo=repo, branch=branch,
+                        root_dir=root_dir.strip("/"), env=env or {}, options=options or {}, parent_id=parent_id,
+                        triggered_by=actor)
+    db.add(dep)
+    db.flush()
+    audit(db, actor, "app.deploy", "app_deployment", dep.id, f"Deploy {repo}@{branch} as {dep.app}")
+    return dep
+
+
+def run_deploy(dep_id: int) -> None:
+    s = get_settings()
+    with session_scope() as db:
+        dep = db.get(AppDeployment, dep_id)
+        repo, branch, app, root_dir = dep.repo, dep.branch, dep.app, dep.root_dir
+        env, options = dict(dep.env or {}), dict(dep.options or {})
+        token = github.get_token(db, options.get("gh_user"))
+        dep.started_at = now()
+    out = DeployLog(dep_id, [token])
+    work = Path(s.apps_workdir) / str(dep_id)
+    try:
+        with servers.use(options.get("server_id")) as target:
+            _deploy_steps(dep_id, repo, branch, app, root_dir, env, options, token, out, work, target)
+    except servers.ServerError as e:
+        out(f"!! {e}")
+        out.flush()
+        _fail(dep_id, "build", str(e), out.text(), work)
+    except DeployFailed as e:
+        if e.stage == "start" and e.output:
+            for ln in e.output.splitlines()[-80:]:
+                out(f"[app] {ln}")
+        out(f"!! {e}")
+        out.flush()
+        _fail(dep_id, e.stage, str(e), out.text(), work)
+    except Exception as e:  # pragma: no cover - unexpected agent errors are still shown to the user
+        log.exception("deploy %s crashed", dep_id)
+        out(f"!! internal error: {e}")
+        out.flush()
+        _fail(dep_id, "build", f"internal error: {e}", out.text(), work)
+    finally:
+        out.flush()
+        shutil.rmtree(work, ignore_errors=True)
+        with _buf_lock:
+            _buffers.pop(dep_id, None)
+
+
+def detect_repo(token: str, repo: str, branch: str, root_dir: str = "") -> dict:
+    """Clone the branch and say how DevAria would build and run it, without building anything."""
+    work = Path(get_settings().apps_workdir) / f"detect-{uuid.uuid4().hex[:10]}"
+    try:
+        work.parent.mkdir(parents=True, exist_ok=True)
+        auth = f"x-access-token:{token}@" if token else ""
+        code, text = executor.run(["git", "clone", "--depth", "1", "--branch", branch,
+                                   f"https://{auth}github.com/{repo}.git", str(work)], timeout=180)
+        if code != 0:
+            raise buildplan.NotBuildable("git clone failed: " + (text.replace(token, "***") if token else text)[-300:])
+        root = work / root_dir.strip("/") if root_dir.strip("/") else work
+        if not root.is_dir():
+            raise buildplan.NotBuildable(f"Folder {root_dir!r} does not exist in the repo.")
+        out = {"languages": buildplan.languages(root), "folders": buildplan.candidates(root)}
+        try:
+            out["plan"] = buildplan.detect(root, {})
+        except buildplan.NotBuildable as e:
+            return {**out, "plan": None, "error": str(e)}
+        out["plan"] = out["plan"].to_dict()
+        return out
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _deploy_steps(dep_id, repo, branch, app, root_dir, env, options, token, out: DeployLog, work: Path,
+                  target: dict | None) -> None:
+    s = get_settings()
+    plan = None
+    if target:
+        out.step(f"Target server: {target['name']} ({target['address']}), Docker over SSH")
+    if not executor.available():
+        raise DeployFailed("build", "Docker is not available to the DevAria backend.")
+    if options.get("reuse_image"):
+        image, plan_port, kind = options["reuse_image"], int(options["port"]), options.get("build_kind")
+        out.step(f"Re-using image {image} (no rebuild)")
+    else:
+        _update(dep_id, status="cloning")
+        out.step(f"Cloning {repo} ({branch})")
+        shutil.rmtree(work, ignore_errors=True)
+        work.parent.mkdir(parents=True, exist_ok=True)
+        auth = f"x-access-token:{token}@" if token else ""
+        code, text = executor.run(["git", "clone", "--depth", "1", "--branch", branch,
+                                   f"https://{auth}github.com/{repo}.git", str(work)], out, timeout=300)
+        if code != 0:
+            raise DeployFailed("clone", "git clone failed", text)
+        _, sha = executor.run(["git", "-C", str(work), "rev-parse", "HEAD"])
+        _, msg = executor.run(["git", "-C", str(work), "log", "-1", "--pretty=%s"])
+        sha = sha.strip().splitlines()[-1] if sha.strip() else None
+        _update(dep_id, commit_sha=sha, commit_message=msg.strip()[:500] or None)
+        out(f"commit {sha} {msg.strip()}")
+
+        root = work / root_dir if root_dir else work
+        if not root.is_dir():
+            raise DeployFailed("build", f"Folder {root_dir!r} does not exist in the repo.")
+        try:
+            plan = buildplan.detect(root, options)
+        except buildplan.NotBuildable as e:
+            raise DeployFailed("build", str(e), str(e)) from e
+        if plan.subdir:  # the app lives in a subfolder: build there, and remember it for redeploys
+            root = root / plan.subdir
+            root_dir = f"{root_dir}/{plan.subdir}".strip("/")
+            _update(dep_id, root_dir=root_dir)
+        out(f"[detect] stack: {plan.stack}")
+        for n in plan.notes:
+            out(f"[detect] {n}")
+        with session_scope() as db:
+            d = db.get(AppDeployment, dep_id)
+            d.metrics = {**(d.metrics or {}), "stack": {k: v for k, v in plan.to_dict().items() if k != "dockerfile"}}
+        if plan.generated:
+            (root / buildplan.GENERATED).write_text(plan.generated)
+            out("[detect] generated Dockerfile:")
+            for ln in plan.generated.strip().splitlines():
+                out(f"    {ln}")
+        _inject_issue_capture(root, app, options, out)
+        image = f"devnexa-app/{app}:{(sha or 'latest')[:12]}-{dep_id}"
+        plan_port, kind = plan.port, plan.kind
+        _update(dep_id, status="building", build_kind=kind, image=image, port=plan_port)
+        out.step(f"Building image {image}" + (f" on {target['name']}" if target else ""))
+        code, text = executor.run(["docker", "build", "--progress=plain", "-t", image,
+                                   "-f", str(root / plan.dockerfile), str(root)], out,
+                                  timeout=s.apps_build_timeout, env={"DOCKER_BUILDKIT": "1"})
+        if code != 0:
+            raise DeployFailed("build", "docker build failed", text)
+
+    if not (options.get("preview_of") or options.get("fix_for")):
+        backups.before_deploy(app, out)
+    _start_and_verify(dep_id, app, image, plan_port, kind, env, options, out)
+    out.step("Deployed")
+    if plan and plan.generated and not options.get("fix_for"):
+        dockerize_pr(dep_id, plan, root / ".dockerignore", out)
+
+
+def _inject_issue_capture(root: Path, app: str, options: dict, out: DeployLog) -> None:
+    """Live issue capture: add DevAria's small browser script to the app's HTML in this build only."""
+    with session_scope() as db:
+        on = releases.get_settings(db, options.get("preview_of") or app)["steps"]["issue_capture"]
+    if not on:
+        return
+    files = issues.inject_agent(root, app)
+    if files:
+        out(f"[detect] live issue capture added to {', '.join(files)} (switch it off in the app's pipeline settings)")
+    else:
+        out("[detect] no static index.html found; to capture browser issues add "
+            f"{issues.script_tag(app)} to your HTML")
+
+
+def _start_and_verify(dep_id, app, image, port, kind, env, options, out: DeployLog):
+    s = get_settings()
+    target = servers.current()
+    container = f"devnexa-app-{app}-{dep_id}"
+    if target:  # a remote server: publish a port there; the DevAria host's Caddy (or the visitor) reaches it
+        host_port = target["port_base"] + dep_id % 1000
+    else:
+        host_port = None if s.apps_domain else s.apps_host_port_base + dep_id % 1000
+    _update(dep_id, status="starting", container=container, port=port, host_port=host_port, image=image,
+            build_kind=kind)
+    out.step(f"Starting container {container}")
+    executor.run(["docker", "rm", "-f", container])
+    cmd = ["docker", "run", "-d", "--name", container] + ([] if target else ["--network", s.apps_network]) + [
+           "--label", "devnexa.logs=true", "--label", f"devnexa.app={app}", "--label", f"devnexa.deployment={dep_id}",
+           "--memory", options.get("memory", s.apps_memory), "--cpus", s.apps_cpus,
+           "-e", f"PORT={port}", "-e", "HOST=0.0.0.0"]
+    extra_args, extra_env = backups.runtime(app)  # persistent /data volume and the app's database URL
+    cmd += extra_args
+    for k, v in {**extra_env, **env}.items():  # the app's own env wins
+        cmd += ["-e", f"{k}={v}"]
+    if host_port:
+        cmd += ["-p", f"{host_port}:{port}"]
+    code, text = executor.run(cmd + [image], out)
+    if code != 0:
+        raise DeployFailed("start", "docker run failed", text)
+
+    need = max(1, s.apps_ready_checks)
+    out.step(f"Health check on port {port} (the current version keeps serving until {need} checks in a row pass)")
+    deadline = time.monotonic() + s.apps_health_timeout
+    status, passed = None, 0
+    while True:  # at least `need` attempts, then retry until the deadline
+        state = inspect(container)
+        if state and not state.get("Running"):
+            logs = container_logs(container, 200)
+            raise DeployFailed("start", f"container exited with code {state.get('ExitCode')}"
+                               + (" (out of memory)" if state.get("OOMKilled") else ""),
+                               logs + ("\nOOMKilled" if state.get("OOMKilled") else ""))
+        status, ms = probe(f"http://{upstream(container, port, host_port, target)}/")
+        if status is not None and status < 500:
+            passed += 1
+            out(f"[health] GET / -> {status} in {ms} ms ({passed}/{need})")
+            if passed >= need:
+                break
+            time.sleep(1)
+            continue
+        passed = 0
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(2)
+    if status is None or status >= 500:
+        logs = container_logs(container, 200)
+        other = app_doctor.detected_port(logs)
+        if other and other != port:
+            out(f"[agent] nothing answers on {port}, logs show the app on {other}: re-routing (low risk, automatic)")
+            st, ms = probe(f"http://{upstream(container, other, host_port, target)}/")
+            if st is not None and st < 500:
+                _record(dep_id, {"action": "reroute_port", "title": app_doctor.APP_ACTIONS["reroute_port"].title,
+                                 "risk": "low", "decision": "auto_execute", "status": "verified",
+                                 "detail": f"Traffic sent to port {other} instead of {port}; GET / -> {st}"})
+                if host_port:  # a host-port mapping cannot be changed on a running container
+                    executor.run(["docker", "rm", "-f", container])
+                    return _start_and_verify(dep_id, app, image, other, kind, env, options, out)
+                port, status = other, st
+                _update(dep_id, port=other)
+        if status is None or status >= 500:
+            raise DeployFailed("start", f"app did not answer on port {port} within {s.apps_health_timeout}s"
+                               + (f" (last HTTP status {status})" if status else ""),
+                               logs + ("\n__port_mismatch__" if other and other != port else ""))
+
+    with session_scope() as db:
+        dep = db.get(AppDeployment, dep_id)
+        dep.status, dep.health, dep.finished_at = "running", "healthy", now()
+        dep.url = public_url(app, host_port, target)
+        older = db.scalars(select(AppDeployment).where(AppDeployment.app == app, AppDeployment.id != dep_id,
+                                                       AppDeployment.status == "running")).all()
+        for o in older:
+            o.status, o.health = "replaced", "stopped"
+        audit(db, "deploy-agent", "app.running", "app_deployment", dep_id, f"{app} is live at {dep.url}")
+        parent = db.get(AppDeployment, dep.parent_id) if dep.parent_id else None
+        if parent and parent.diagnosis:
+            _verify_parent(db, parent, f"Deploy #{dep_id} succeeded", dep_id)
+        old_containers = [(o.container, (o.options or {}).get("server_id")) for o in older if o.container]
+    if old_containers:  # the previous version may run on another server
+        out(f"[switch] traffic now goes to {container}; {', '.join(c for c, _ in old_containers)} drains for "
+            f"{s.apps_drain_seconds:g}s, then stops (zero-downtime rollout)")
+    retire(old_containers)
+    out(f"[url] {public_url(app, host_port, target)}")
+    releases.on_live(dep_id, env, options)
+    if options.get("fix_for"):
+        finish_fix(dep_id, ok=True, out=out)
+    if merge := options.get("merge_after"):  # conflicts were resolved and the merged branch is healthy
+        from . import fixer, runner
+
+        out("[merge] merged branch passed its check; merging the pull request and rolling out")
+        runner.submit(fixer.auto_merge, merge["preview_id"], merge.get("actor", "merge-agent"), merge.get("attempt", 1))
+
+
+def retire(containers: list, drain: float | None = None) -> None:
+    """Stop containers that no longer get traffic, after letting in-flight requests finish. Each item is a
+    container name (on this host) or a (container, server_id) pair."""
+    containers = [c if isinstance(c, tuple) else (c, None) for c in containers if c]
+    containers = [(c, sid) for c, sid in containers if c]
+    if not containers:
+        return
+    drain = get_settings().apps_drain_seconds if drain is None else drain
+
+    def stop():
+        for c, sid in containers:
+            try:
+                with servers.use(sid):
+                    executor.run(["docker", "rm", "-f", c])
+            except servers.ServerError:
+                pass
+
+    if drain <= 0:
+        stop()
+    else:
+        t = threading.Timer(drain, stop)
+        t.daemon = True
+        t.start()
+
+
+def _mine(r: dict, child_id: int | None) -> bool:
+    """Does remediation `r` belong to child deploy `child_id`? (Old entries carry no child id.)"""
+    return child_id is None or r.get("child_id") in (None, child_id)
+
+
+def _verify_parent(db, parent: AppDeployment, detail: str, child_id: int | None = None):
+    rems = [dict(r) for r in parent.remediations or []]
+    for r in rems:
+        if r["status"] in ("running", "executed") and _mine(r, child_id):
+            r.update(status="verified", verified_at=now().isoformat(), detail=r.get("detail", "") + f" · {detail}")
+            app_doctor.remember(db, parent.diagnosis, parent.repo, r["action"], "fixed")
+    parent.remediations = rems
+
+
+def _fail(dep_id: int, stage: str, message: str, output: str, work: Path):
+    with session_scope() as db:
+        dep = db.get(AppDeployment, dep_id)
+        dep.status, dep.health, dep.error, dep.finished_at = "failed", "down", message, now()
+        is_fix_check = bool((dep.options or {}).get("fix_for"))
+        diag = app_doctor.diagnose(db, stage, output or message, work / dep.root_dir if work.exists() else None,
+                                   build_kind=dep.build_kind)
+        dep.diagnosis = diag
+        audit(db, "deploy-agent", "app.failed", "app_deployment", dep_id, f"{stage} failed: {diag['title']}")
+        parent = db.get(AppDeployment, dep.parent_id) if dep.parent_id else None
+        if parent and parent.diagnosis:
+            rems = [dict(r) for r in parent.remediations or []]
+            for r in rems:
+                if r["status"] in ("running", "executed") and _mine(r, dep_id) and not is_fix_check:
+                    r.update(status="failed", detail=r.get("detail", "") + f" · deploy #{dep_id} failed again")
+                    app_doctor.remember(db, parent.diagnosis, parent.repo, r["action"], "did_not_fix")
+            parent.remediations = rems
+    if is_fix_check:  # the agent's own fix branch failed its check: report it, do not stack more fixes
+        finish_fix(dep_id, ok=False)
+        return
+    remediate(dep_id)
+
+
+# ------------------------------------------------------------- remediation
+def _record(dep_id: int, entry: dict) -> int:
+    with session_scope() as db:
+        dep = db.get(AppDeployment, dep_id)
+        rems = list(dep.remediations or [])
+        entry = {"id": len(rems), "at": now().isoformat(), **entry}
+        rems.append(entry)
+        dep.remediations = rems
+        return entry["id"]
+
+
+def _set_rem(dep_id: int, rem_id: int, **fields):
+    with session_scope() as db:
+        dep = db.get(AppDeployment, dep_id)
+        rems = [dict(r) for r in dep.remediations]
+        rems[rem_id].update(fields)
+        dep.remediations = rems
+
+
+def _auto_depth(db, dep: AppDeployment) -> int:
+    depth, cur = 0, dep
+    while cur.parent_id:
+        depth += 1
+        cur = db.get(AppDeployment, cur.parent_id)
+    return depth
+
+
+def remediate(dep_id: int, diag: dict | None = None) -> None:
+    """Graded autonomy: low-risk allowlisted fixes run now; medium/high wait for approval."""
+    with session_scope() as db:
+        dep = db.get(AppDeployment, dep_id)
+        diag = diag or dep.diagnosis
+        if not diag:
+            return
+        action = diag["action"]
+        if action == "rollback_app" or (diag.get("stage") == "runtime" and action == "escalate"):
+            action = "rollback_app" if _last_good(db, dep) else "escalate"
+        spec = app_doctor.APP_ACTIONS[action]
+        auto = policy.get_autonomy(db)
+        if spec.risk == "low" and spec.allowlisted and auto["auto_execute_low"] \
+                and diag["confidence"] >= auto["min_confidence_for_auto"] and _auto_depth(db, dep) < 2:
+            decision, reason = "auto_execute", "Low-risk allowlisted fix: running automatically."
+        elif action == "open_fix_pr" and diag.get("patch") and auto.get("auto_fix_branch", True) \
+                and _auto_depth(db, dep) < 2:
+            decision, reason = "auto_execute", ("Code fix: pushed to a new branch and checked on a preview URL "
+                                                "first. Merging the pull request stays with you.")
+        elif spec.risk == "low" and action == "escalate":
+            decision, reason = "auto_execute", "No safe automatic fix: evidence handed to a developer."
+        elif spec.risk == "low":
+            decision, reason = "approval_required", "Automation limit reached or confidence too low; needs a person."
+        else:
+            decision, reason = "approval_required", f"{spec.risk.title()}-risk fix: waiting for human approval."
+    rem_id = _record(dep_id, {"action": action, "title": spec.title, "risk": spec.risk, "decision": decision,
+                              "reason": reason, "status": "pending_approval" if decision != "auto_execute" else "running",
+                              "has_patch": bool(diag.get("patch"))})
+    if decision == "auto_execute":
+        execute(dep_id, rem_id, actor="policy")
+
+
+def _last_good(db, dep: AppDeployment) -> AppDeployment | None:
+    return db.scalars(select(AppDeployment).where(
+        AppDeployment.app == dep.app, AppDeployment.id != dep.id, AppDeployment.image.is_not(None),
+        AppDeployment.status.in_(("replaced", "running")), AppDeployment.health != "down",
+    ).order_by(AppDeployment.id.desc())).first()
+
+
+REDEPLOY_ACTIONS = ("retry_deploy", "use_npm_install", "prune_docker", "raise_memory", "change_runtime",
+                    "use_legacy_peer_deps", "add_build_tools", "skip_typecheck", "change_output_dir")
+STABLE_FIX_BRANCH = {"npm_peer_deps"}  # the same fix every time: one branch, one PR
+OPTION_KEYS = ("npm_install", "memory", "runtime_version", "legacy_peer_deps", "build_tools", "skip_typecheck",
+               "spa_out")
+
+
+def execute(dep_id: int, rem_id: int, actor: str) -> dict:
+    from . import runner
+
+    with session_scope() as db:
+        dep = db.get(AppDeployment, dep_id)
+        rem = dict(dep.remediations[rem_id])
+        diag = dep.diagnosis or {}
+        audit(db, actor, f"app.remediation.{rem['action']}", "app_deployment", dep_id, rem["title"])
+        base = dict(repo=dep.repo, branch=dep.branch, app=dep.app, root_dir=dep.root_dir, env=dict(dep.env or {}),
+                    parent_id=dep.id, actor=actor)
+        options = dict(dep.options or {})
+        action = rem["action"]
+        new = None
+        result: dict = {}
+        if action in REDEPLOY_ACTIONS:
+            if action == "use_npm_install":
+                options["npm_install"] = True
+            if action == "use_legacy_peer_deps":
+                options["legacy_peer_deps"] = True
+            if action == "add_build_tools":
+                options["build_tools"] = True
+            if action == "skip_typecheck":
+                options["skip_typecheck"] = True
+            if action == "change_output_dir" and diag.get("spa_out"):
+                options["spa_out"] = diag["spa_out"]
+            if action == "change_runtime" and diag.get("runtime_version"):
+                options["runtime_version"] = diag["runtime_version"]
+            if action == "raise_memory":
+                cur = re.sub(r"\D", "", options.get("memory", get_settings().apps_memory)) or "512"
+                options["memory"] = f"{int(cur) * 2}m"
+            new = create_deployment(db, options=options, **base)
+            result = {"detail": f"Started deploy #{new.id}" + (" with " + json.dumps(
+                {k: options[k] for k in OPTION_KEYS if k in options}) if action != "retry_deploy" else ""),
+                      "child_id": new.id}
+        elif action == "rollback_app":
+            good = _last_good(db, dep)
+            if not good:
+                result = {"status": "failed", "detail": "No earlier healthy deployment to roll back to."}
+            else:
+                new = create_deployment(db, options={**options, "reuse_image": good.image, "port": good.port,
+                                                     "build_kind": good.build_kind}, **base)
+                result = {"detail": f"Rolling back to image of deploy #{good.id} as deploy #{new.id}", "child_id": new.id}
+        elif action == "restart_app":
+            pass
+        elif action == "open_fix_pr":
+            if not diag.get("patch"):
+                result = {"status": "failed", "detail": "No patch was proposed."}
+        elif action == "escalate":
+            result = {"status": "escalated", "detail": "Developer needs to act; diagnosis and log evidence attached."}
+        container, repo, branch, sha, app = dep.container, dep.repo, dep.branch, dep.commit_sha, dep.app
+        root_dir = dep.root_dir
+        token = github.get_token(db, options.get("gh_user"))
+        new_id = new.id if new else None
+
+    try:
+        with servers.use(options.get("server_id")):
+            if action == "prune_docker":
+                executor.run(["docker", "image", "prune", "-f"])
+                executor.run(["docker", "builder", "prune", "-f"])
+            if action == "restart_app":
+                code, text = executor.run(["docker", "restart", container]) if container else (1, "no container")
+    except servers.ServerError as e:
+        code, text = 1, str(e)
+    if action == "restart_app":
+        result = {"status": "executed" if code == 0 else "failed", "detail": text.strip()[-300:] or "restarted"}
+        with session_scope() as db:
+            d = db.get(AppDeployment, dep_id)
+            d.restarts = (d.restarts or 0) + 1
+            if code == 0:
+                d.status, d.health = "running", "recovering"
+    if action == "open_fix_pr" and diag.get("patch"):
+        # one branch (and so one PR) per kind of mechanical fix, so redeploying the same failure reuses it
+        fix_branch = f"devnexa/fix-{app}-" + (slugify(diag["category"]) if diag.get("category") in STABLE_FIX_BRANCH
+                                               else str(dep_id))
+        files = {(f"{root_dir}/{p}" if root_dir else p): c for p, c in diag["patch"].items()}
+        try:
+            base_sha = sha or github.branch_sha(token, repo, branch)
+            github.push_branch(token, repo, base_sha, files, fix_branch)
+        except github.GitHubError as e:
+            result = {"status": "failed", "detail": f"Could not push the fix branch: {e}"}
+        else:
+            with session_scope() as db:
+                d = db.get(AppDeployment, dep_id)
+                opts = {k: v for k, v in (d.options or {}).items() if k != "reuse_image"}
+                opts["fix_for"] = {"dep": dep_id, "rem": rem_id, "base": branch, "branch": fix_branch}
+                preview = create_deployment(db, repo, fix_branch, f"{app}-fix-{dep_id}", root_dir,
+                                            dict(d.env or {}), opts, parent_id=dep_id, actor=actor)
+                new_id = preview.id
+            result = {"detail": f"Fix pushed to branch {fix_branch}; checking it on preview deploy #{new_id}. "
+                                "The pull request opens once the preview is healthy.",
+                      "branch": fix_branch, "preview_id": new_id, "child_id": new_id}
+    result.setdefault("status", "executed")
+    _set_rem(dep_id, rem_id, executed_at=now().isoformat(), decided_by=actor, **result)
+    if new_id:
+        runner.submit(run_deploy, new_id)
+    if action in REDEPLOY_ACTIONS and diag.get("patch"):
+        _follow_up_pr(dep_id, diag, actor)
+    return result
+
+
+def _follow_up_pr(dep_id: int, diag: dict, actor: str) -> None:
+    """The redeploy works around the failure; this makes the repo itself build (e.g. `.npmrc` with
+    legacy-peer-deps) on a fix branch + preview + PR, so it does not depend on DevAria's build flags."""
+    with session_scope() as db:
+        if not policy.get_autonomy(db).get("auto_fix_branch", True):
+            return
+    spec = app_doctor.APP_ACTIONS["open_fix_pr"]
+    rem_id = _record(dep_id, {"action": "open_fix_pr", "title": spec.title, "risk": spec.risk,
+                              "decision": "auto_execute", "status": "running", "has_patch": True,
+                              "reason": "Permanent fix for the repo, checked on a preview URL first. "
+                                        "Merging the pull request stays with you."})
+    execute(dep_id, rem_id, actor)
+
+
+def decide(dep_id: int, rem_id: int, approve: bool, actor: str) -> dict:
+    with session_scope() as db:
+        dep = db.get(AppDeployment, dep_id)
+        if rem_id >= len(dep.remediations or []):
+            raise KeyError("remediation not found")
+        rem = dep.remediations[rem_id]
+        if rem["status"] != "pending_approval":
+            raise ValueError(f"remediation is {rem['status']}")
+        if not approve:
+            audit(db, actor, "app.remediation.rejected", "app_deployment", dep_id, rem["title"])
+    if not approve:
+        _set_rem(dep_id, rem_id, status="rejected", decided_by=actor, executed_at=now().isoformat())
+        return {"status": "rejected"}
+    _set_rem(dep_id, rem_id, status="running", decided_by=actor)
+    return execute(dep_id, rem_id, actor)
+
+
+DOCKERIGNORE = ".git\nnode_modules\n.env\n.env.*\n__pycache__\n*.pyc\n.venv\nvenv\n"
+
+
+def _pr_body(intro: str, rows: list[tuple[str, str]], footer: str = "") -> str:
+    lines = [intro, ""] + [f"**{k}:** {v}" for k, v in rows if v]
+    return "\n\n".join(lines) + (f"\n\n{footer}" if footer else "") + \
+        "\n\n---\n_Opened by the DevAria Deploy Agent. Nothing merges until you approve it._"
+
+
+def dockerize_pr(dep_id: int, plan, dockerignore: Path, out: DeployLog | None = None) -> None:
+    """The repo had no Dockerfile and the deploy just worked with a generated one: offer it to the repo
+    on a new branch, so the repo builds the same way anywhere. Once per repo/branch/folder."""
+    with session_scope() as db:
+        dep = db.get(AppDeployment, dep_id)
+        if not policy.get_autonomy(db).get("auto_fix_branch", True):
+            return
+        key = f"{dep.repo}@{dep.branch}:{dep.root_dir}"
+        done = db.get(KeyValue, "dockerize_prs")
+        if done and key in done.value:
+            return
+        repo, branch, sha, app, root_dir = dep.repo, dep.branch, dep.commit_sha, dep.app, dep.root_dir
+        token = github.get_token(db, (dep.options or {}).get("gh_user"))
+    prefix = f"{root_dir}/" if root_dir else ""
+    files = {f"{prefix}Dockerfile": plan.generated}
+    if not dockerignore.exists():
+        files[f"{prefix}.dockerignore"] = DOCKERIGNORE
+    fix_branch = f"devnexa/dockerize-{app}"
+    entry = {"action": "add_dockerfile", "title": app_doctor.APP_ACTIONS["add_dockerfile"].title, "risk": "low",
+             "decision": "auto_execute", "reason": "The repo has no Dockerfile; DevAria generated one and this "
+             "deploy proved it works.", "branch": fix_branch}
+    try:
+        github.push_branch(token, repo, sha or github.branch_sha(token, repo, branch), files, fix_branch,
+                           message="build: add {path} (DevAria)")
+        url = github.open_pr(token, repo, branch, fix_branch, f"Add a Dockerfile for {app} (DevAria)", _pr_body(
+            f"DevAria deployed `{repo}` (`{branch}`) with a Dockerfile it generated, because the repo had none. "
+            "Merging this keeps future builds identical on any Docker host.",
+            [("Detected stack", plan.kind), ("App port", str(plan.port)),
+             ("Verified by", f"deploy #{dep_id}, which passed its health check"),
+             ("Notes", " ".join(plan.notes))]))
+        entry.update(status="verified", detail="Pull request opened", pr_url=url)
+    except github.GitHubError as e:
+        entry.update(status="failed", detail=f"Could not open the Dockerfile pull request: {e}")
+        url = None
+    _record(dep_id, entry)
+    if out:
+        out(f"[agent] {entry['detail']}" + (f": {url}" if url else ""))
+    if url:
+        with session_scope() as db:
+            row = db.get(KeyValue, "dockerize_prs")
+            value = {**(row.value if row else {}), key: url}
+            if row:
+                row.value = value
+            else:
+                db.add(KeyValue(key="dockerize_prs", value=value))
+            audit(db, "deploy-agent", "app.dockerize_pr", "app_deployment", dep_id, url)
+
+
+def finish_fix(preview_id: int, ok: bool, out: DeployLog | None = None) -> None:
+    """A fix branch finished its preview deploy: open the PR if it is healthy, report it if not."""
+    with session_scope() as db:
+        preview = db.get(AppDeployment, preview_id)
+        info = (preview.options or {}).get("fix_for") or {}
+        parent = db.get(AppDeployment, info.get("dep"))
+        if not parent:
+            return
+        diag = parent.diagnosis or {}
+        token = github.get_token(db, (parent.options or {}).get("gh_user"))
+        repo, url, err, parent_id, base = parent.repo, preview.url, preview.error, parent.id, parent.branch
+    rem_id = info.get("rem")
+    if not ok:
+        _set_rem(parent_id, rem_id, status="failed", preview_url=None,
+                 detail=f"The fix on {info.get('branch')} did not pass its check (deploy #{preview_id}: {err}). "
+                        "No pull request was opened; the branch is left for a developer.")
+        return
+    try:
+        pr = github.open_pr(token, repo, info.get("base") or base, info["branch"],
+                            f"fix: {diag.get('title', 'deploy failure')} (DevAria)", _pr_body(
+                                f"Deploy #{parent_id} of `{repo}` failed. DevAria's Deploy Agent pushed this fix and "
+                                f"checked it: preview deploy #{preview_id} is healthy.",
+                                [("Root cause", diag.get("root_cause")), ("Change", diag.get("suggestion")),
+                                 ("Test it", url), ("Confidence", f"{diag.get('confidence', 0):.2f} "
+                                                                  f"({diag.get('provider')})")],
+                                "```\n" + "\n".join((diag.get("evidence") or [])[:12]) + "\n```"))
+        _set_rem(parent_id, rem_id, pr_url=pr, preview_url=url,
+                 detail=f"Fix verified on {url}. Pull request opened; merge it to ship the fix.")
+        if out:
+            out(f"[agent] fix verified, pull request: {pr}")
+    except github.GitHubError as e:
+        _set_rem(parent_id, rem_id, preview_url=url, detail=f"Fix verified on {url}, but the PR failed: {e}")
+
+
+# --------------------------------------------------------------- monitoring
+def inspect(container: str) -> dict | None:
+    code, text = executor.run(["docker", "inspect", "-f", "{{json .State}}", container])
+    if code != 0:
+        return None
+    try:
+        return json.loads(text.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
+
+
+def container_logs(container: str, tail: int = 200, since: str | None = None) -> str:
+    cmd = ["docker", "logs", "--tail", str(tail)] + (["--since", since] if since else []) + [container]
+    return executor.run(cmd)[1]
+
+
+def _stats(container: str) -> dict:
+    code, text = executor.run(["docker", "stats", "--no-stream", "--format", "{{json .}}", container])
+    try:
+        d = json.loads(text.strip().splitlines()[-1]) if code == 0 else {}
+    except (ValueError, IndexError):
+        return {}
+    mem = re.match(r"([\d.]+)\s*([KMG]i?B)", d.get("MemUsage", ""))
+    mult = {"KiB": 1 / 1024, "KB": 1 / 1000, "MiB": 1, "MB": 1, "GiB": 1024, "GB": 1000}
+    return {"cpu_pct": float(d.get("CPUPerc", "0").rstrip("%") or 0),
+            "mem_mb": round(float(mem.group(1)) * mult.get(mem.group(2), 1), 1) if mem else None}
+
+
+def monitor_tick() -> None:
+    """One pass of the Monitoring Agent over every running app."""
+    with session_scope() as db:
+        deps = [(d.id, d.container, d.port, d.host_port, d.restarts or 0, (d.options or {}).get("server_id"))
+                for d in db.scalars(select(AppDeployment).where(AppDeployment.status == "running"))]
+    for dep_id, container, port, host_port, restarts, server_id in deps:
+        try:
+            with servers.use(server_id) as target:
+                _monitor_one(dep_id, container, port, host_port, restarts, target)
+        except servers.ServerError:
+            continue
+        except Exception:  # pragma: no cover - one unreachable server must not stop monitoring the others
+            log.exception("monitoring deployment %s failed", dep_id)
+    for app in apps_with_replicas():
+        releases.check_replicas(app)
+    releases.run_due_backups()
+    try:
+        backups.run_due()
+    except Exception:  # pragma: no cover - a backup problem must never stop monitoring
+        log.exception("smart backups pass failed")
+    autodeploy_tick()
+
+
+def _monitor_one(dep_id: int, container: str, port: int, host_port: int | None, restarts: int,
+                 target: dict | None) -> None:
+    s = get_settings()
+    state = inspect(container) or {}
+    sample = {"t": now().isoformat(), "running": bool(state.get("Running"))}
+    errors: list[str] = []
+    recent = ""
+    if state.get("Running"):
+        sample["status"], sample["latency_ms"] = probe(f"http://{upstream(container, port, host_port, target)}/")
+        sample.update(_stats(container))
+        recent = container_logs(container, 300, since=f"{int(s.apps_monitor_interval) + 5}s")
+        errors = [ln for ln in recent.splitlines() if ERROR_LINE.search(ln)]
+        sample["errors"] = len(errors)
+    healthy = sample["running"] and sample.get("status") is not None and sample["status"] < 500
+    with session_scope() as db:
+        dep = db.get(AppDeployment, dep_id)
+        m = dict(dep.metrics or {})
+        m["history"] = (m.get("history", []) + [sample])[-60:]
+        m["last"] = sample
+        m["consecutive_failures"] = 0 if healthy else m.get("consecutive_failures", 0) + 1
+        if errors_seen := sample.get("errors"):
+            m["recent_errors"] = (m.get("recent_errors", []) + errors[-5:])[-20:]
+        dep.metrics = m
+        prev = dep.health
+        dep.health = "healthy" if healthy and not errors_seen else ("degraded" if healthy else "down")
+        if healthy and prev == "recovering":
+            _verify_restart(db, dep)
+        trip = not sample["running"] or m["consecutive_failures"] >= 3
+        if trip:
+            m["consecutive_failures"] = 0
+            dep.metrics = dict(m)
+    if trip:
+        _runtime_incident(dep_id, container, state, restarts)
+    if recent:
+        _capture_server_issues(dep_id, recent)
+
+
+_last_autodeploy = 0.0
+AUTODEPLOY_KEY = "autodeploy_tried"
+
+
+def autodeploy_tick(force: bool = False) -> list[int]:
+    """Auto-deploy: when an app's branch has a new commit on GitHub (a merged pull request or a push), roll it
+    out, also without the GitHub webhook. Each commit is tried once, so a commit that fails to build does not
+    loop; the next commit is tried again."""
+    global _last_autodeploy
+    s = get_settings()
+    if not force and (s.apps_autodeploy_interval <= 0
+                      or time.monotonic() - _last_autodeploy < s.apps_autodeploy_interval):
+        return []
+    _last_autodeploy = time.monotonic()
+    with session_scope() as db:
+        live: dict[str, AppDeployment] = {}
+        for d in db.scalars(select(AppDeployment).where(AppDeployment.status == "running").order_by(AppDeployment.id)):
+            live[d.app] = d
+        rows = []
+        for app, d in live.items():
+            opts = d.options or {}
+            if not releases.get_settings(db, opts.get("preview_of") or app)["steps"].get("auto_deploy", True):
+                continue
+            rows.append((app, d.repo, d.branch, d.commit_sha or "", opts.get("gh_user")))
+        tried_row = db.get(KeyValue, AUTODEPLOY_KEY)
+        tried = dict(tried_row.value) if tried_row else {}
+    started = []
+    for app, repo, branch, deployed, gh_user in rows:
+        with session_scope() as db:
+            token = github.get_token(db, gh_user)
+        if not token:
+            continue
+        try:
+            sha = github.branch_sha(token, repo, branch)
+        except github.GitHubError:
+            continue
+        if not sha or (deployed and sha.startswith(deployed)) or tried.get(app) == sha:
+            continue
+        with session_scope() as db:
+            busy = db.scalars(select(AppDeployment.id).where(AppDeployment.app == app,
+                                                             AppDeployment.status.in_(ACTIVE))).first()
+            if busy:
+                continue
+            cur = db.scalars(select(AppDeployment).where(AppDeployment.app == app, AppDeployment.status == "running")
+                             .order_by(AppDeployment.id.desc())).first()
+            if not cur:
+                continue
+            opts = {k: v for k, v in (cur.options or {}).items() if k not in ("reuse_image", "source", "merge_after",
+                                                                               "fix_for")}
+            opts["source"] = "auto-deploy"
+            new = create_deployment(db, cur.repo, cur.branch, app, cur.root_dir, dict(cur.env or {}), opts,
+                                    actor="auto-deploy")
+            audit(db, "deploy-agent", "app.autodeploy", "app_deployment", new.id,
+                  f"{app}: {branch} moved to {sha[:7]} (was {deployed[:7] or 'unknown'}); rolling it out")
+            tried[app] = sha
+            row = db.get(KeyValue, AUTODEPLOY_KEY)
+            if row:
+                row.value = dict(tried)
+            else:
+                db.add(KeyValue(key=AUTODEPLOY_KEY, value=dict(tried)))
+            started.append(new.id)
+    from . import runner
+
+    for dep_id in started:
+        runner.submit(run_deploy, dep_id)
+    return started
+
+
+def apps_with_replicas() -> list[str]:
+    with session_scope() as db:
+        return [a for (a,) in db.execute(select(AppDeployment.app).where(AppDeployment.status == "running").distinct())
+                if releases.lb_status(db, a)["replicas"]]
+
+
+def _capture_server_issues(dep_id: int, text: str) -> None:
+    """Error lines and HTTP 5xx responses in the app's logs become live issues; repeated ones get auto-fixed."""
+    from . import fixer, runner
+
+    with session_scope() as db:
+        dep = db.get(AppDeployment, dep_id)
+        found = issues.from_logs(db, dep.app, dep_id, text)
+        auto = [i.id for i in {i.id: i for i in found}.values() if fixer.should_auto_fix(db, i)]
+        for i in auto:
+            db.get(AppIssue, i).fix = {"status": "queued", "started_by": "fix-agent", "at": now().isoformat()}
+    for i in auto:
+        runner.submit(fixer.start_fix, i, "fix-agent")
+
+
+def _verify_restart(db, dep: AppDeployment):
+    rems = [dict(r) for r in dep.remediations or []]
+    for r in rems:
+        if r["action"] == "restart_app" and r["status"] == "executed":
+            r.update(status="verified", verified_at=now().isoformat())
+            app_doctor.remember(db, r.get("diagnosis") or dep.diagnosis or {}, dep.repo, "restart_app", "fixed")
+    dep.remediations = rems
+
+
+def _runtime_incident(dep_id: int, container: str, state: dict, restarts: int) -> None:
+    s = get_settings()
+    logs = container_logs(container, 200) + ("\nOOMKilled" if state.get("OOMKilled") else "")
+    with session_scope() as db:
+        dep = db.get(AppDeployment, dep_id)
+        diag = app_doctor.diagnose(db, "runtime", logs)
+        if diag["action"] not in ("raise_memory", "open_fix_pr"):
+            diag.update(action="restart_app" if restarts < s.apps_max_auto_restarts else "rollback_app")
+        a = app_doctor.APP_ACTIONS[diag["action"]]
+        diag.update(action_title=a.title, risk=a.risk)
+        dep.diagnosis = diag
+        dep.health = "down"
+        audit(db, "monitoring-agent", "app.incident", "app_deployment", dep_id, f"{dep.app}: {diag['title']}")
+    remediate(dep_id, diag)
+
+
+_monitor_started = False
+
+
+def start_monitor() -> None:
+    global _monitor_started
+    if _monitor_started or not executor.available():
+        return
+    _monitor_started = True
+
+    def loop():
+        while True:
+            time.sleep(get_settings().apps_monitor_interval)
+            try:
+                monitor_tick()
+            except Exception:  # pragma: no cover
+                log.exception("app monitor tick failed")
+
+    threading.Thread(target=loop, name="devnexa-app-monitor", daemon=True).start()
