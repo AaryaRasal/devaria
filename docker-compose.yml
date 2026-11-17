@@ -1,21 +1,17 @@
-# DevAria full stack. `docker compose up --build`, then open http://localhost:5173
-# DEVNEXA_MODE=simulated runs the agents against the in-memory model instead of the live sample app.
-# On a server with a domain: set DEVNEXA_DOMAIN in .env and add `--profile https` for automatic HTTPS.
+# DevAria lean production stack: Postgres + backend + frontend + Caddy (HTTPS).
+# Run:  docker compose --profile https up -d --build --remove-orphans
+# Only Caddy (80/443) is reachable from the internet. Everything else stays on the internal Docker network.
 name: devnexa
-
-x-logs: &logs
-  labels:
-    devnexa.logs: "true"
 
 services:
   postgres:
     image: pgvector/pgvector:pg16
+    restart: unless-stopped
     environment:
       POSTGRES_USER: devnexa
       POSTGRES_PASSWORD: devnexa
       POSTGRES_DB: devnexa
     volumes: [pgdata:/var/lib/postgresql/data]
-    ports: ["127.0.0.1:5432:5432"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U devnexa"]
       interval: 5s
@@ -23,6 +19,7 @@ services:
 
   backend:
     build: ./backend
+    restart: unless-stopped
     environment:
       DEVNEXA_DATABASE_URL: postgresql+psycopg://devnexa:devnexa@postgres:5432/devnexa
       DEVNEXA_ENVIRONMENT_MODE: ${DEVNEXA_MODE:-live}
@@ -31,49 +28,39 @@ services:
       DEVNEXA_LLM_API_KEY: ${DEVNEXA_LLM_API_KEY:-}
       DEVNEXA_LLM_BASE_URL: ${DEVNEXA_LLM_BASE_URL:-}
       DEVNEXA_GITHUB_WEBHOOK_SECRET: ${DEVNEXA_GITHUB_WEBHOOK_SECRET:-}
-      DEVNEXA_SAMPLE_APP_CONTAINER: devnexa-sample-app
-      # Live pipelines really build, test and deploy the sample app: from the pushed commit of this repo when
-      # GitHub triggers them, otherwise from the checkout mounted below. Also the repo for incident commit evidence.
-      DEVNEXA_SAMPLE_APP_SRC: /workspace/sample-app
-      DEVNEXA_GITHUB_REPO: ${DEVNEXA_GITHUB_REPO:-Inveon-Technologies/DevAria}
-      # Deploy from GitHub: Sign in with GitHub (below) or the admin key unlocks it in the dashboard. With DEVNEXA_APPS_DOMAIN set (needs a
-      # wildcard DNS record *.<domain>), apps get https://<app>.<domain>; otherwise http://<host>:20000-20999.
+      DEVNEXA_GITHUB_REPO: ${DEVNEXA_GITHUB_REPO:-}
       DEVNEXA_ADMIN_TOKEN: ${DEVNEXA_ADMIN_TOKEN:-}
-      # Sign in with GitHub (OAuth app). Callback URL: <DEVNEXA_PUBLIC_URL>/api/auth/github/callback
       DEVNEXA_GITHUB_CLIENT_ID: ${DEVNEXA_GITHUB_CLIENT_ID:-}
       DEVNEXA_GITHUB_CLIENT_SECRET: ${DEVNEXA_GITHUB_CLIENT_SECRET:-}
       DEVNEXA_GITHUB_ALLOWED_USERS: ${DEVNEXA_GITHUB_ALLOWED_USERS:-}
+      DEVNEXA_GITHUB_SIGNUP: ${DEVNEXA_GITHUB_SIGNUP:-approval}
       DEVNEXA_PUBLIC_URL: ${DEVNEXA_PUBLIC_URL:-}
       DEVNEXA_SESSION_SECRET: ${DEVNEXA_SESSION_SECRET:-}
       DEVNEXA_GITHUB_TOKEN: ${DEVNEXA_GITHUB_TOKEN:-}
       DEVNEXA_APPS_DOMAIN: ${DEVNEXA_APPS_DOMAIN:-}
       DEVNEXA_APPS_PUBLIC_HOST: ${DEVNEXA_DOMAIN:-localhost}
       DEVNEXA_APPS_NETWORK: devnexa_default
-      # Smart backups, the trash and backup import. Helper containers (pg_dump, mysqldump, mongodump, tar) reach the
-      # backup files through the same named volume.
       DEVNEXA_BACKUPS_DIR: /var/lib/devnexa/backups
       DEVNEXA_BACKUPS_VOLUME: devnexa-backups
       DEVNEXA_TRASH_DAYS: ${DEVNEXA_TRASH_DAYS:-14}
       DEVNEXA_BACKUP_IMPORT_MAX_MB: ${DEVNEXA_BACKUP_IMPORT_MAX_MB:-2048}
     depends_on:
       postgres: { condition: service_healthy }
-    ports: ["8000:8000"]
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./sample-app:/workspace/sample-app:ro
       # Caddy's access log for deployed apps, read for the dashboard's live traffic view.
       - caddy_logs:/var/log/caddy:ro
       - backups:/var/lib/devnexa/backups
-    <<: *logs
 
   frontend:
     build: ./frontend
+    restart: unless-stopped
     depends_on: [backend]
-    ports: ["5173:80"]
 
   caddy:
     image: caddy:2.8.4
     profiles: [https]
+    restart: unless-stopped
     environment:
       DEVNEXA_DOMAIN: ${DEVNEXA_DOMAIN:-localhost}
     depends_on: [frontend, backend]
@@ -83,68 +70,9 @@ services:
       - caddy_data:/data
       - caddy_config:/config
       - caddy_logs:/var/log/caddy
-    restart: unless-stopped
-
-  sample-app:
-    build: ./sample-app
-    container_name: devnexa-sample-app
-    environment:
-      LOADGEN: "true"
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
-      OTEL_SERVICE_NAME: orders-service
-    volumes: [sampledata:/data]
-    ports: ["8081:8000"]
-    labels:
-      devnexa.logs: "true"
-      devnexa.service: orders-service
-
-  prometheus:
-    image: prom/prometheus:v2.54.1
-    volumes:
-      - ./infra/prometheus:/etc/prometheus:ro
-    ports: ["9090:9090"]
-
-  alertmanager:
-    image: prom/alertmanager:v0.27.0
-    command: ["--config.file=/etc/alertmanager/alertmanager.yml"]
-    volumes:
-      - ./infra/alertmanager:/etc/alertmanager:ro
-    ports: ["9093:9093"]
-
-  loki:
-    image: grafana/loki:3.1.1
-    command: ["-config.file=/etc/loki/loki.yml"]
-    volumes:
-      - ./infra/loki:/etc/loki:ro
-    ports: ["3100:3100"]
-
-  promtail:
-    image: grafana/promtail:3.1.1
-    command: ["-config.file=/etc/promtail/promtail.yml"]
-    volumes:
-      - ./infra/promtail:/etc/promtail:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    depends_on: [loki]
-
-  jaeger:
-    image: jaegertracing/all-in-one:1.60
-    environment:
-      COLLECTOR_OTLP_ENABLED: "true"
-    ports: ["16686:16686", "4317:4317"]
-
-  grafana:
-    image: grafana/grafana:11.2.0
-    environment:
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
-    volumes:
-      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
-    ports: ["3000:3000"]
 
 volumes:
   pgdata:
-  sampledata:
   caddy_data:
   caddy_config:
   caddy_logs:
